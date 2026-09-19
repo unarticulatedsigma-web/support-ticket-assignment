@@ -1,0 +1,91 @@
+# Product Requirements: Support Ticket Assignment
+
+## The problem
+
+Support teams currently rely on a team lead manually watching the incoming ticket queue and assigning each new ticket to whoever they know is available. This breaks down as the team grows:
+
+- Tickets that arrive while the lead is offline sit unassigned for hours.
+- The lead becomes a bottleneck, spending their day triaging instead of doing their own work.
+- Work isn't shared evenly — some agents get buried while others sit idle.
+
+We're building a system that automatically assigns each new ticket to the right person on the right team, respecting who is actually available at that moment and spreading work fairly, without requiring a human to watch the queue.
+
+## Target users
+
+- **Team lead** — sets up and maintains their team's availability, and needs to trust the assignment logic enough to stop manually triaging. Needs visibility into whether the team's schedule actually covers the hours tickets arrive in, and needs to be able to understand why any given ticket landed with a specific agent.
+- **Support agent** — the person tickets get assigned to. Not a direct user of the UI in this scope, but their workload (active ticket count/weight) is the primary input the system reasons about.
+- **Calling system / API consumer** — whatever creates tickets (out of scope to build) calls the assignment API with a `company_id` and `ticket_id` and expects back a single agent to own it.
+
+## Scope
+
+**In scope**
+
+- UI for a company to define and maintain agent availability: recurring weekly schedule blocks (day of week + start/end time) per agent, each tagged with that agent's timezone.
+- Assignment API: given `company_id` + `ticket_id`, returns the agent who should own the ticket.
+- Fair, capacity-aware assignment that accounts for agents' current active workload, weighted by ticket effort (small/medium/huge), not raw ticket count.
+- A view for the team lead to see whether the team's combined availability covers all hours that need coverage (coverage gap visibility).
+- A logged, human-readable reason for every assignment decision.
+
+**Out of scope** (per brief, plus decisions made during design)
+
+- Login, auth, roles/permissions, billing, account management.
+- Mobile support.
+- Holiday calendars and one-off availability overrides (a single agent being out sick/on vacation for a day).
+- Third-party integrations (PagerDuty, Opsgenie, etc.).
+- Creating companies, agents, or tickets — these are assumed to already exist (via seed data / fixtures).
+- Ticket urgency/priority as a routing factor. Considered during design and explicitly dropped: any time-windowed or delayed assignment scheme conflicts with the "never leave a ticket unowned" requirement, and priority-based routing added complexity disproportionate to the trial's scope. Every ticket — regardless of how urgent it might be — is assigned instantly using the same logic.
+- Reassignment if an agent goes offline mid-ticket, or if a better-fit agent becomes available after assignment.
+- Auto-classification of ticket effort from ticket content (NLP/keyword rules).
+
+## Core behavior
+
+**Availability** is defined per agent as a set of recurring weekly time blocks in the agent's own timezone (IANA identifier, DST-aware). A ticket's arrival instant is checked against each agent's blocks, converted into that agent's local time, to determine who is "available right now."
+
+**Fairness** is capacity-aware, not purely round-robin. Each ticket carries an effort level (small/medium/huge, set at creation) mapped to a numeric weight (e.g. 1/2/4). An agent's "active load" is the sum of the weights of their currently open tickets — not a raw count — so a person holding one huge ticket isn't treated as less busy than someone holding three small ones. Concretely: **fairness means minimizing the difference in current weighted active load among eligible agents at assignment time** — it's a live snapshot comparison, not a historical quota or an equal-count guarantee.
+
+**Assignment algorithm** (runs instantly, per ticket, at creation time):
+
+1. Filter the company's agents to those available right now, per their recurring schedule.
+2. Drop any agent at or over the max active-load cap. The cap is a single **company-wide** configurable threshold, expressed in the same units as ticket weights — not per-agent or role-based, to keep the trial's model simple.
+3. Among the remainder, pick the agent with the lowest active weighted load.
+4. Among agents tied at that minimum load (e.g. Alice=2, Bob=2, both below Charlie=5), tie-break by least-recently-assigned — the tie-break only ever compares agents already tied on load, never the full candidate pool.
+5. Final tie-break by agent ID, so the outcome is always deterministic and reproducible.
+
+**Concurrency.** Two tickets can arrive at nearly the same instant. If both assignment requests read agent load independently before either write lands, they can both see the same "Alice is least loaded" snapshot and both route to Alice — silently breaking the fairness guarantee. The assignment decision and the resulting load update are therefore performed as a single atomic/transactional operation (e.g. one database transaction, or a per-company lock around the read-decide-write sequence), so a second concurrent request always observes the first request's effect on load before making its own decision. This is the simplest correctness guarantee the trial needs — full distributed-systems-grade concurrency handling is out of scope.
+
+Every decision is logged with the reason (who was considered, who was excluded and why, why the winner won), satisfying the "lead should understand why" requirement and making the logic testable.
+
+**Coverage gaps vs. assignment-time capacity.** These are two different problems and the design treats them separately:
+
+- A **coverage gap** is a recurring period in the team's weekly schedule where no agent is ever scheduled to be available (e.g. nobody covers Monday 01:00–09:00 IST, every week). It's detected by converting every agent's recurring local availability into a common reference timezone and taking the union of all their intervals — any uncovered period is a gap. This is a scheduling problem, and the fix is the team lead adjusting agent schedules. The lead-facing UI shows both each agent's individual schedule and the team's combined coverage (normalized to one timezone) so gaps are visible before they ever cause a real assignment problem.
+- **Assignment-time zero eligible candidates** is different: the schedule may have full coverage, but at the moment a specific ticket arrives, every scheduled agent happens to be at or over their capacity cap. This is a capacity problem, not a coverage problem, and it's transient rather than structural.
+
+The two failure modes (plus the normal cases) that the assignment logic must distinguish:
+
+| Situation | Meaning | Behavior |
+|---|---|---|
+| No agent scheduled at all | Coverage gap | Flagged to the lead via the availability UI |
+| Agents scheduled, but ticket arrives outside their hours | Unavailable | Excluded from candidates |
+| Agents scheduled and available, but at/over capacity | Capacity exhaustion | Excluded from candidates; explained in the assignment log |
+| Agents scheduled, available, under capacity | Normal | Assigned fairly per the algorithm above |
+| Zero candidates remain after all filters | Assignment-time failure | API returns an explicit "no eligible agent" result rather than guessing; reason is recorded in the assignment log |
+
+**Known deviation from a stated requirement.** The brief states "a new ticket should not be left without an owner." Under normal operation this holds — every ticket is assigned immediately. But if zero eligible agents exist at assignment time, we deliberately relax that requirement rather than violate a different one: we do not silently assign the ticket to someone unavailable or over capacity just to guarantee an owner. An explicit, logged failure is more honest and more debuggable than a fabricated assignment, even though it means the "always owned" guarantee isn't absolute. Under the seed-data assumption below, this path shouldn't actually be exercised in the demo — but the behavior is defined, not left undefined, for the case where it is.
+
+## Assumptions
+
+- Ticket effort (small/medium/huge) is provided at ticket creation (via seed data in this build); the system does not infer it.
+- Demo/seed data is set up so the team's combined availability covers all hours across timezones — i.e., no genuine recurring coverage gap exists in the sample data. This means the "no agent currently available" fallback path is not exercised by the assignment logic in this build, though the gap-detection/visibility feature is still built and would surface a gap if one existed in the data.
+- "Active" ticket, for load purposes, means open/in-progress; resolved/closed tickets drop out of an agent's load immediately. This is also what bounds the case of an agent being away for several days without the system knowing (one-off absences are out of scope, below): their open tickets stay open and their load stays high, so the capacity cap naturally stops new tickets from piling onto them — it doesn't require any leave-tracking to avoid unbounded pileup.
+- Assignment and ticket ownership updates are performed transactionally, so concurrent assignment requests observe a consistent workload rather than racing on a stale load snapshot.
+- Whoever uses the availability UI is assumed authorized (no roles/permissions, per FAQ).
+- The system runs locally; no deployment is required.
+
+## What's simplified or stubbed, and why
+
+- **No urgency/priority routing** — every ticket uses the same instant, weighted-load logic regardless of stated urgency, to avoid reintroducing "ticket sits unassigned" delays via a windowed-assignment scheme.
+- **No one-off absences or holiday overrides** — out of scope per brief; only the recurring weekly schedule is modeled.
+- **No fallback/overflow policy for assignment-time zero candidates** — under the seed-data assumption above, the assignment API should never actually hit this case in the demo, but the behavior is still defined rather than left undefined: if it ever occurs, the API returns an explicit "no eligible agent" response and logs the reason, instead of silently assigning to someone unavailable or over capacity. A production version would add a configurable fallback (e.g. an overflow queue or a designated backup agent) — deliberately not built here since it's a real design decision on its own, not a stub.
+- **Static effort weights** (e.g. 1/2/4) — a fixed heuristic, not calibrated against real resolution-time data.
+- **No reassignment** — if an agent goes offline mid-ticket, their load isn't rebalanced; the ticket stays with them.
+- **No fairness memory beyond "current active load" and "last assignment time"** — the system doesn't track cumulative volume over a longer window (e.g., a week), so it optimizes instantaneous fairness rather than long-run fairness.

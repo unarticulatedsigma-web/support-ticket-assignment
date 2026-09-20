@@ -89,3 +89,4 @@ The two failure modes (plus the normal cases) that the assignment logic must dis
 - **Static effort weights** (e.g. 1/2/4) — a fixed heuristic, not calibrated against real resolution-time data.
 - **No reassignment** — if an agent goes offline mid-ticket, their load isn't rebalanced; the ticket stays with them.
 - **No fairness memory beyond "current active load" and "last assignment time"** — the system doesn't track cumulative volume over a longer window (e.g., a week), so it optimizes instantaneous fairness rather than long-run fairness.
+

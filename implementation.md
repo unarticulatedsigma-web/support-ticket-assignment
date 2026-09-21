@@ -154,7 +154,7 @@ Tickets are created with `status='assignment_pending'` by default (there is no s
 
 `isWithinSchedule(agent, instantUtc)`: convert `instantUtc` into `agent.timezone` (via a timezone library — `luxon` or `date-fns-tz`, not manual offset math, so DST is handled automatically), get the resulting local day-of-week and time-of-day, and check whether it falls within any of the agent's `AvailabilityBlock` rows for that day, using half-open `[start_time, end_time)` semantics.
 
-**Overnight blocks are rejected, not silently wrong.** A block like Sunday `22:00–02:00` (wrapping past midnight) can't be matched correctly by a same-day check — Monday `01:00` would never match a row stored under `day_of_week=Sunday`. Rather than build wraparound matching logic, `PUT .../availability` validates `end_time > start_time` and rejects any block that would cross midnight; the UI and API require an overnight shift to be entered as two rows (e.g. Sun `22:00–23:59` + Mon `00:00–02:00`). Simpler to implement correctly than wraparound matching, and still expressible from the UI.
+**Overnight blocks are rejected, not silently wrong.** A block like Sunday `22:00–02:00` (wrapping past midnight) can't be matched correctly by a same-day check — Monday `01:00` would never match a row stored under `day_of_week=Sunday`. Rather than build wraparound matching logic, `PUT .../availability` validates `end_time > start_time` and rejects any block that would cross midnight; the UI and API require an overnight shift to be entered as two rows: Sun `22:00–24:00` + Mon `00:00–02:00`. `24:00:00` is a valid Postgres `time` value (its documented range is `00:00:00`–`24:00:00`) representing exactly the end of the day — combined with the half-open `[start, end)` semantics above, this loses no time at the boundary, unlike a `23:59` workaround which would leave the last minute uncovered by anyone. API/UI validation accepts `24:00:00` as the one exception to normal end-time range checks.
 
 ### Concurrency
 
@@ -217,7 +217,7 @@ The reconciliation interval is the only one of these values — fixed constant, 
 
 **Unit**
 - `isWithinSchedule` across a DST boundary (block that's 9am–5pm local before and after a spring-forward/fall-back date).
-- `isWithinSchedule` rejects/never matches an overnight block; a shift split into two same-day rows matches correctly across midnight.
+- `isWithinSchedule` rejects/never matches an overnight block; a shift split as `22:00–24:00` + `00:00–02:00` covers every instant across midnight with no gap, including the last minute before 00:00.
 - Capacity cap: agent at `cap - weight` is included; agent at `cap - weight + 1` is excluded.
 - **An agent with zero active tickets is correctly eligible** — `computeActiveLoad` returns `0`, not `NULL`, and is included in capacity comparisons.
 - Tie-break order: equal load → `last_assigned_at` (including null-vs-set) → `agent.id`; `AssignmentDecision.candidates` for that case contains each candidate's pre-decision `last_assigned_at`, not the post-write value.
